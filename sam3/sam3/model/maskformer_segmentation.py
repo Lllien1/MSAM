@@ -63,6 +63,8 @@ class SegmentationHead(nn.Module):
         act_ckpt=False,
         shared_conv=False,
         compile_mode_pixel_decoder=None,
+        iou_head: bool = False,
+        iou_use_sigmoid: bool = False,
     ):
         super().__init__()
         self.use_encoder_inputs = use_encoder_inputs
@@ -87,7 +89,11 @@ class SegmentationHead(nn.Module):
         self.act_ckpt = act_ckpt
 
         # used to update the output dictionary
-        self.instance_keys = ["pred_masks"]
+        self.instance_keys = ["pred_masks", "iou_predictions"]
+        self.iou_head = None
+        self.iou_use_sigmoid = iou_use_sigmoid
+        if iou_head and not no_dec:
+            self.iou_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
     @property
     def device(self):
@@ -166,7 +172,20 @@ class SegmentationHead(nn.Module):
         else:
             mask_pred = self.mask_predictor(obj_queries[-1], pixel_embed)
 
-        return {"pred_masks": mask_pred}
+        iou_pred = None
+        if self.iou_head is not None:
+            queries = None
+            if torch.is_tensor(obj_queries):
+                if obj_queries.dim() == 3:
+                    queries = obj_queries
+                elif obj_queries.dim() == 4:
+                    queries = obj_queries[-1]
+            if queries is not None:
+                iou_pred = self.iou_head(queries).squeeze(-1)
+                if self.iou_use_sigmoid:
+                    iou_pred = iou_pred.sigmoid()
+
+        return {"pred_masks": mask_pred, "iou_predictions": iou_pred}
 
 
 class PixelDecoder(nn.Module):
@@ -233,6 +252,8 @@ class UniversalSegmentationHead(SegmentationHead):
         presence_head: bool = False,
         dot_product_scorer=None,
         cross_attend_prompt=None,
+        iou_head: bool = False,
+        iou_use_sigmoid: bool = False,
     ):
         super().__init__(
             hidden_dim=hidden_dim,
@@ -242,6 +263,8 @@ class UniversalSegmentationHead(SegmentationHead):
             no_dec=no_dec,
             pixel_decoder=pixel_decoder,
             act_ckpt=act_ckpt,
+            iou_head=iou_head,
+            iou_use_sigmoid=iou_use_sigmoid,
         )
         self.d_model = hidden_dim
 
