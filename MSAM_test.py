@@ -1,11 +1,14 @@
 import argparse
 import os
 import sys
+import time
 from typing import List
 
+import numpy as np
 import torch
-from PIL import Image
-from torchvision.utils import save_image
+from PIL import Image, ImageDraw, ImageFont
+from torchvision import transforms
+from tqdm import tqdm
 
 # ensure local sam3 package is importable
 sys.path.append(os.path.join(os.path.dirname(__file__), "sam3"))
@@ -66,6 +69,21 @@ def run_inference(args):
     loader = build_loader(args.data_root, args.meta_path or os.path.join(args.data_root, "meta.json"), args.mode, args.batch_size)
     model = load_model(args, device)
     os.makedirs(args.output_dir, exist_ok=True)
+    to_pil = transforms.ToPILImage()
+    colors = [
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 128, 0),
+        (128, 0, 255),
+    ]
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
 
     # parse custom prompt if provided (comma-separated words)
     custom_prompt: List[str] = []
@@ -73,12 +91,23 @@ def run_inference(args):
         custom_prompt = [w.strip() for w in args.prompt.split(",") if w.strip()]
 
     idx = 0
-    for images, masks, prompt_lists, class_names in loader:
+    total_imgs = 0
+    total_time = 0.0
+    dice_sum = 0.0
+    dice_cnt = 0
+
+    pbar = tqdm(loader, desc="Inference", leave=True)
+    for images, masks, prompt_lists, class_names in pbar:
         images = images.to(device)
         # override dataset prompts with a custom prompt if given
         if custom_prompt:
             prompt_lists = [custom_prompt for _ in prompt_lists]
+        start = time.time()
         out = model(images, prompt_lists)
+        infer_time = time.time() - start
+        total_time += infer_time
+        total_imgs += images.size(0)
+
         pred_masks = out["pred_masks"]
         if pred_masks is None:
             continue
@@ -93,10 +122,58 @@ def run_inference(args):
                 pred_masks, size=masks.shape[-2:], mode="bilinear", align_corners=False
             )
 
+        # simple dice metric per image (only if GT has positives)
+        gt = (masks > 0.5).float().to(device)
+        valid = gt.flatten(1).sum(dim=1) > 0
+        if valid.any():
+            pm = pred_masks[valid]
+            gm = gt[valid]
+            pm_bin = (pm > 0.5).float()
+            num = 2 * (pm_bin * gm).sum(dim=(1, 2, 3))
+            den = pm_bin.sum(dim=(1, 2, 3)) + gm.sum(dim=(1, 2, 3)) + 1e-6
+            dice_batch = (num / den).mean().item()
+            dice_sum += dice_batch * valid.sum().item()
+            dice_cnt += valid.sum().item()
+
         for b in range(pred_masks.shape[0]):
-            save_path = os.path.join(args.output_dir, f"pred_{idx}.png")
-            save_image(pred_masks[b], save_path)
+            cls_name = class_names[b]
+            prompt_text = "_".join(prompt_lists[b]) if prompt_lists else "prompt"
+            sample_dir = os.path.join(args.output_dir, cls_name)
+            os.makedirs(sample_dir, exist_ok=True)
+
+            # overlay mask on image
+            img_pil = to_pil(images[b].cpu())
+            mask_np = pred_masks[b].squeeze().cpu().numpy()
+            img_np = np.array(img_pil).astype(np.float32) / 255.0
+            if mask_np.ndim == 2:
+                mask_np = np.clip(mask_np, 0, 1)
+            else:
+                mask_np = np.clip(mask_np[0], 0, 1)
+            color = np.array(colors[b % len(colors)]) / 255.0
+            alpha = 0.5
+            overlay_np = img_np * (1 - alpha * mask_np[..., None]) + color * (alpha * mask_np[..., None])
+            overlay_np = np.clip(overlay_np * 255.0, 0, 255).astype(np.uint8)
+            overlay_pil = Image.fromarray(overlay_np)
+
+            # draw prompt text bottom-left
+            draw = ImageDraw.Draw(overlay_pil)
+            text = prompt_text
+            text_w, text_h = draw.textbbox((0, 0), text, font=font)[2:]
+            draw.rectangle([0, overlay_pil.height - text_h - 4, text_w + 4, overlay_pil.height], fill=(0, 0, 0))
+            draw.text((2, overlay_pil.height - text_h - 2), text, fill=(255, 255, 255), font=font)
+
+            overlay_path = os.path.join(sample_dir, f"{cls_name}_{prompt_text}_{idx}.png")
+            overlay_pil.save(overlay_path)
+
             idx += 1
+
+        speed = total_imgs / total_time if total_time > 0 else 0.0
+        avg_dice = dice_sum / dice_cnt if dice_cnt > 0 else 0.0
+        pbar.set_postfix(imgs=total_imgs, fps=speed, dice=avg_dice)
+
+    final_speed = total_imgs / total_time if total_time > 0 else 0.0
+    final_dice = dice_sum / dice_cnt if dice_cnt > 0 else 0.0
+    print(f"[INFO] Inference done. images={total_imgs}, fps={final_speed:.2f}, avg_dice={final_dice:.4f}")
 
 
 if __name__ == "__main__":
