@@ -1,0 +1,31 @@
+25-10-09 23:06:22.088 - INFO: groundingdino_config: ./models/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py
+25-10-09 23:06:22.088 - INFO: grounded_checkpoint: /root/autodl-tmp/FiLo/ckpt/grounding_train_on_mvtec.pth
+25-10-09 23:06:22.088 - INFO: clip_model: ViT-L-14-336
+25-10-09 23:06:22.088 - INFO: clip_pretrained: openai
+25-10-09 23:06:22.088 - INFO: image_size: 518
+25-10-09 23:06:22.088 - INFO: features_list: [6, 12, 18, 24]
+25-10-09 23:06:22.088 - INFO: dataset: visa
+25-10-09 23:06:22.088 - INFO: data_path: /root/autodl-tmp/FiLo/data/VisA_20220922
+25-10-09 23:06:22.088 - INFO: box_threshold: 0.25
+25-10-09 23:06:22.088 - INFO: text_threshold: 0.25
+25-10-09 23:06:22.088 - INFO: area_threshold: 0.7
+25-10-09 23:06:22.088 - INFO: device: cuda
+25-10-09 23:06:22.088 - INFO: ckpt_path: /root/autodl-tmp/FiLo/ckpt/filo_train_on_mvtec.pth
+25-10-09 23:06:22.088 - INFO: n_ctx: 12
+25-10-09 23:06:22.088 - INFO: viz_dir: /root/autodl-tmp/FiLo/viz_out
+25-10-09 23:26:49.475 - INFO: 
+| objects    |   auroc_px |   f1_px |   ap_px |   aupro |   auroc_sp |   f1_sp |   ap_sp |
+|:-----------|-----------:|--------:|--------:|--------:|-----------:|--------:|--------:|
+| cashew     |       93.4 |    27.3 |    22.7 |    88.3 |       88   |    84.9 |    94.8 |
+| pipe fryum |       95.5 |    22.2 |    15.7 |    79.6 |       86.4 |    87.1 |    93.4 |
+| capsules   |       94.9 |    30.9 |    21.1 |    83.4 |       82   |    82.2 |    89.8 |
+| chewinggum |       99.6 |    78.7 |    84.7 |    93.5 |       97.2 |    93.5 |    98.7 |
+| fryum      |       94.4 |    28.4 |    23   |    83.8 |       83.4 |    84.2 |    92.1 |
+| macaroni1  |       99.3 |    29.5 |    21.5 |    94.3 |       86.7 |    78.5 |    89   |
+| macaroni2  |       98.8 |    23.1 |    11   |    92.3 |       74.3 |    72.2 |    75   |
+| candle     |       98.7 |    45.5 |    38.1 |    89.4 |       88.6 |    82.7 |    91.3 |
+| pcb3       |       89.1 |    17   |     7.5 |    69.1 |       61.5 |    67.1 |    63.2 |
+| pcb1       |       93.5 |    23   |    15   |    78.2 |       79.8 |    75.1 |    82   |
+| pcb2       |       92.2 |    29.7 |    20   |    80.7 |       82.9 |    77.3 |    83.1 |
+| pcb4       |       96   |    36   |    31.7 |    89.6 |       95.7 |    90.3 |    95.2 |
+| mean       |       95.5 |    32.6 |    26   |    85.2 |       83.9 |    81.3 |    87.3 |

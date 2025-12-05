@@ -1,0 +1,5 @@
+list.txt
+meta.json
+mvtec.py
+mvtec_anomaly_detection
+visa.py

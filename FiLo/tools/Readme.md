@@ -1,0 +1,1 @@
+gdino_only.py使用的时候要使用build_meta_from_visa.py创建出来的meta.json
