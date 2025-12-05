@@ -216,17 +216,27 @@ def main(args: argparse.Namespace):
             if iou_pred is not None:
                 if iou_pred.dim() == 3:
                     iou_pred = iou_pred[-1]
-                if mask_for_iou.dim() == 3:
-                    mask_for_iou = mask_for_iou.unsqueeze(1)
-                mask_prob = torch.sigmoid(mask_for_iou)
-                prob_flat = mask_prob.flatten(2)
-                target_flat = masks.unsqueeze(1).flatten(2)
-                intersection = (prob_flat * target_flat).sum(dim=-1)
-                union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
-                # Avoid degenerate all-zero cases: union==0 -> IoU=0
-                true_iou = torch.where(
-                    union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
-                )
+                with torch.no_grad():
+                    if mask_for_iou.dim() == 3:
+                        mask_for_iou = mask_for_iou.unsqueeze(1)
+                    target_size = (256, 256)
+                    mask_for_iou_down = torch.nn.functional.interpolate(
+                        mask_for_iou, size=target_size, mode="bilinear", align_corners=False
+                    )
+                    gt_masks = masks
+                    if gt_masks.dim() == 3:
+                        gt_masks = gt_masks.unsqueeze(1)
+                    gt_masks_down = torch.nn.functional.interpolate(
+                        gt_masks, size=target_size, mode="nearest"
+                    )
+                    mask_prob = torch.sigmoid(mask_for_iou_down)
+                    prob_flat = mask_prob.flatten(2)
+                    target_flat = gt_masks_down.flatten(2)
+                    intersection = (prob_flat * target_flat).sum(dim=-1)
+                    union = prob_flat.sum(dim=-1) + target_flat.sum(dim=-1) - intersection
+                    true_iou = torch.where(
+                        union > 0, intersection / (union + 1e-6), torch.zeros_like(union)
+                    )
                 if iou_pred.shape[1] == 1 and true_iou.shape[1] > 1:
                     iou_pred = iou_pred.expand(true_iou.shape[0], true_iou.shape[1])
                 loss_iou = F.mse_loss(iou_pred, true_iou)
