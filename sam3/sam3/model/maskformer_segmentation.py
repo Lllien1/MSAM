@@ -339,8 +339,23 @@ class UniversalSegmentationHead(SegmentationHead):
         else:
             mask_pred = self.mask_predictor(obj_queries[-1], instance_embeds)
 
+        iou_pred = None
+        if self.iou_head is not None:
+            queries_for_iou = obj_queries
+            if torch.is_tensor(obj_queries):
+                if obj_queries.dim() == 4:
+                    queries_for_iou = obj_queries[-1]
+                elif obj_queries.dim() == 3:
+                    queries_for_iou = obj_queries
+            elif isinstance(obj_queries, (list, tuple)):
+                queries_for_iou = obj_queries[-1]
+            iou_pred = self.iou_head(queries_for_iou).squeeze(-1)
+            if self.iou_use_sigmoid:
+                iou_pred = iou_pred.sigmoid()
+
         return {
             "pred_masks": mask_pred,
             "semantic_seg": self.semantic_seg_head(pixel_embed),
             "presence_logit": presence_logit,
+            "iou_predictions": iou_pred,
         }
