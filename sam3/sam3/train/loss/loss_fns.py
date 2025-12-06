@@ -113,6 +113,9 @@ def _dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True)
         numerator = 2 * (inputs * targets).sum(-1)
     else:
         inputs = inputs.flatten(1)
+        #----------------------------增加目标的扁平，不懂是不是官方的缺陷----------------------------
+        targets = targets.flatten(1)
+        #----------------------------增加目标的扁平，不懂是不是官方的缺陷----------------------------
         numerator = 2 * (inputs * targets).sum(1)
     denominator = inputs.sum(-1) + targets.sum(-1)
     loss = 1 - (numerator + 1) / (denominator + 1)
