@@ -547,8 +547,9 @@ def main(args: argparse.Namespace):
 
                 # Now produce per-image indices for downstream use
                 out["indices"] = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device)
+                # keep a local alias for convenience
+                indices = out["indices"]
                 # --- end matcher robust handling ---
-
                 
 
                 # ====== DEBUG BLOCK ======
@@ -652,12 +653,12 @@ def main(args: argparse.Namespace):
                     # parameters (add to parser if you like)
                     NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image) if hasattr(args, "neg_samples_per_image") else 5
                     MASK_DOWNSAMPLE = getattr(args, "mask_downsample", 256)  # 可在 parser 增加 --mask_downsample
-                    
+
                     loss_focal_bg = torch.tensor(0.0, device=device)
                     loss_dice_bg = torch.tensor(0.0, device=device)
                     total_bg_samples = 0.0
                     all_q = torch.arange(pred_masks.shape[1], device=device)
-                    
+
                     for b in range(pred_masks.shape[0]):
                         src_q, tgt_q = indices[b]  # indices 从 convert_matcher_output_to_indices 得到
                         if src_q.numel() == 0:
@@ -666,14 +667,14 @@ def main(args: argparse.Namespace):
                             mask_un = torch.ones_like(all_q, dtype=torch.bool)
                             mask_un[src_q] = False
                             unmatched_q = all_q[mask_un]
-                    
+
                         if unmatched_q.numel() == 0:
                             continue
                         
                         k = min(NEG_SAMPLES_PER_IMAGE, int(unmatched_q.numel()))
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
-                    
+
                         preds_bg = pred_masks[b, sampled_unmatched_q]  # shape (k, H, W)
                         # Downsample to save memory
                         if preds_bg.dim() == 3:
@@ -683,9 +684,9 @@ def main(args: argparse.Namespace):
                             ).squeeze(1)
                         else:
                             preds_bg_ds = preds_bg
-                    
+
                         zeros = torch.zeros_like(preds_bg_ds)
-                    
+
                         nb = float(sampled_unmatched_q.numel())
                         # compute losses on downsampled masks (same API)
                         loss_focal_bg += sam_sigmoid_focal_loss(
@@ -694,12 +695,12 @@ def main(args: argparse.Namespace):
                         )
                         loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
                         total_bg_samples += nb
-                    
+
                     # normalize
                     if total_bg_samples > 0:
                         loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
                         loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
-                    
+
                     loss_focal = loss_focal + 0.5 * loss_focal_bg
                     loss_dice = loss_dice + 0.5 * loss_dice_bg
 
