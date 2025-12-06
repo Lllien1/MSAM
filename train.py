@@ -83,38 +83,108 @@ def build_batched_targets_from_binary_masks(masks: torch.Tensor):
     }
 
 
-def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B, device):
+def convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B: int, device, targets_num_boxes=None):
     """
-    Convert flat matcher output to list of (src, tgt) per batch.
+    Convert matcher outputs (batch_idx, src_idx, tgt_idx) into per-image lists:
+      [(src_q_tensor, tgt_q_tensor), ...] of length B.
 
-    This version is robust to src_idx/tgt_idx being None (matcher returning no matches).
-    Always returns a list of length B; each element is a pair of 1D LongTensors on `device`.
+    Robust behavior:
+      - If tgt_idx is None: reconstruct tgt_q per-image using targets_num_boxes when available.
+        * If targets_num_boxes[b] == 1, and some src matched for image b, we set tgt_q to zeros of same length.
+        * If targets_num_boxes[b] > 1, we assign tgt_q = 0 repeated (fallback) and print a warning.
+      - If tgt_idx is provided and is flattened global indices, convert to local per-image indices
+        using cumulative sums of targets_num_boxes.
+      - Returns list of tuples (src_q, tgt_q) for each image.
     """
-    # If no matcher output or no matches at all, return empty lists per image
-    if batch_idx is None or src_idx is None or tgt_idx is None:
-        empty_pair = (torch.zeros((0,), dtype=torch.long, device=device),
-                      torch.zeros((0,), dtype=torch.long, device=device))
-        return [empty_pair for _ in range(B)]
+    B = int(B)
+    out = []
+    # prepare empty default per image
+    for _ in range(B):
+        out.append((torch.zeros((0,), dtype=torch.long, device=device),
+                    torch.zeros((0,), dtype=torch.long, device=device)))
 
-    # Ensure tensors are on the right device and are 1D
-    batch_idx = batch_idx.to(device)
-    src_idx = src_idx.to(device)
-    tgt_idx = tgt_idx.to(device)
+    if batch_idx is None or src_idx is None:
+        return out
 
-    indices = []
+    # ensure tensors on device/long
+    batch_idx = batch_idx.to(device).long()
+    src_idx = src_idx.to(device).long()
+
+    # if targets_num_boxes is None, we'll only fill srcs, and leave tgts empty when not present
+    if tgt_idx is None:
+        # group src_idx by batch index
+        for b in range(B):
+            mask = (batch_idx == b)
+            if mask.any():
+                srcs = src_idx[mask]
+                # default: no tgt info, try to reconstruct using targets_num_boxes
+                if targets_num_boxes is not None:
+                    nb = int(targets_num_boxes[b])
+                    if nb == 0:
+                        tgts = torch.zeros((0,), dtype=torch.long, device=device)
+                    elif nb == 1:
+                        # assign the only GT (index 0) for all matched srcs
+                        tgts = torch.zeros((srcs.numel(),), dtype=torch.long, device=device)
+                    else:
+                        # multiple GTs for this image but no mapping info -> fallback: assign 0 and warn
+                        print(f"[WARN] convert_matcher_output_to_indices: image {b} has {nb} GTs but matcher returned no tgt_idx. Falling back to tgt=0 for all matched srcs.")
+                        tgts = torch.zeros((srcs.numel(),), dtype=torch.long, device=device)
+                else:
+                    # no info about targets; set empty tgt
+                    tgts = torch.zeros((0,), dtype=torch.long, device=device)
+                out[b] = (srcs, tgts)
+            else:
+                out[b] = (torch.zeros((0,), dtype=torch.long, device=device),
+                          torch.zeros((0,), dtype=torch.long, device=device))
+        return out
+
+    # tgt_idx provided: ensure on device and long
+    tgt_idx = tgt_idx.to(device).long()
+
+    # If targets_num_boxes provided, compute cumulative offsets for flattened -> local index mapping
+    cum = None
+    if targets_num_boxes is not None:
+        # ensure list/array of ints
+        tnb = [int(x) for x in targets_num_boxes]
+        cum = [0]
+        for nb in tnb:
+            cum.append(cum[-1] + nb)
+        # cum length B+1
+    # Now iterate matches and allocate per-image lists
+    # We assume batch_idx, src_idx, tgt_idx are parallel lists of same length
+    assert batch_idx.numel() == src_idx.numel() == tgt_idx.numel(), "Matcher outputs lengths mismatch"
+
+    # We'll accumulate in python lists, then convert to tensors
+    src_lists = [[] for _ in range(B)]
+    tgt_lists = [[] for _ in range(B)]
+    for i in range(batch_idx.numel()):
+        b = int(batch_idx[i].item())
+        s = int(src_idx[i].item())
+        tg = int(tgt_idx[i].item())
+        if cum is not None:
+            # map flattened tg to local index for image b: local = tg - cum[b]
+            local = tg - cum[b]
+            if local < 0 or local >= (cum[b+1] - cum[b]):
+                # Something inconsistent: warn and skip
+                print(f"[WARN] convert_matcher_output_to_indices: flattened tgt {tg} maps to local {local} out of range for image {b} (num_boxes={cum[b+1]-cum[b]}). Skipping this match.")
+                continue
+            tgt_local = int(local)
+        else:
+            # No targets_num_boxes: we cannot reliably map; keep tgt as is (but will be inconsistent)
+            tgt_local = tg
+        src_lists[b].append(s)
+        tgt_lists[b].append(tgt_local)
+
+    # convert lists to tensors
     for b in range(B):
-        mask = (batch_idx == b)
-        if mask.sum() == 0:
-            indices.append(
-                (
-                    torch.zeros((0,), dtype=torch.long, device=device),
-                    torch.zeros((0,), dtype=torch.long, device=device),
-                )
-            )
-            continue
-        # index with mask returns 1D tensors of matches for that image
-        indices.append((src_idx[mask].to(device), tgt_idx[mask].to(device)))
-    return indices
+        if len(src_lists[b]) == 0:
+            out[b] = (torch.zeros((0,), dtype=torch.long, device=device),
+                      torch.zeros((0,), dtype=torch.long, device=device))
+        else:
+            out[b] = (torch.tensor(src_lists[b], dtype=torch.long, device=device),
+                      torch.tensor(tgt_lists[b], dtype=torch.long, device=device))
+    return out
+
 
 
 
@@ -330,7 +400,7 @@ def main(args: argparse.Namespace):
     # === 新增：从 args 里读出两个超参数 ===
     MASK_DOWNSAMPLE = int(args.mask_downsample)
     NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image)
-    
+
     if args.use_official:
         model = FineTuneSAM3Official(
             bpe_path=args.bpe_path,
@@ -550,10 +620,11 @@ def main(args: argparse.Namespace):
                         # Keep tgt_idx as None if we couldn't reconstruct any (then no matched pairs effectively)
                         tgt_idx = None
 
-                # Now produce per-image indices for downstream use
-                out["indices"] = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device)
-                # keep a local alias for convenience
-                indices = out["indices"]
+                # assume targets defined earlier
+                targets_num_boxes = targets["num_boxes"].tolist()  # list of ints
+                out["indices"] = convert_matcher_output_to_indices(batch_idx, src_idx, tgt_idx, B=pred_masks.shape[0], device=device, targets_num_boxes=targets_num_boxes)
+                indices = out["indices"]  # local alias for later loops
+
                 # --- end matcher robust handling ---
                 
 
@@ -819,30 +890,62 @@ def main(args: argparse.Namespace):
                 # Contrastive alignment (InfoNCE) between visual pooled vector and prompt prototype
                 align_loss = torch.tensor(0.0, device=device)
                 if args.lambda_align is not None and float(args.lambda_align) > 0.0:
-                    # get prompt prototype: call prompt_learner (returns seq-first)
+                    # get prompt prototype: call prompt_learner (returns sequence-first often)
                     prompt_seq, prompt_mask = model.prompt_learner(prompt_lists, device=device)
-                    # prompt_seq shape: (S, B, D)
-                    prompt_proto = prompt_seq[-1].transpose(0, 1)  # (B, D)
-
+                    # prompt_seq[-1] might be shape (B, D) or (D, B) or (S, B, D) depending on implementation
+                    prompt_last = prompt_seq[-1]
+                
+                    # Normalize prompt_last to (B, D)
+                    if prompt_last.dim() == 2:
+                        # either (B,D) or (D,B)
+                        if prompt_last.shape[0] == B:
+                            prompt_proto = prompt_last  # (B, D)
+                        elif prompt_last.shape[1] == B:
+                            prompt_proto = prompt_last.transpose(0, 1)  # (B, D)
+                        else:
+                            # fallback: try reshape
+                            prompt_proto = prompt_last.reshape(B, -1)[:, :prompt_last.numel() // B]
+                    elif prompt_last.dim() == 3:
+                        # shape (S, B, D) -> take last along S
+                        prompt_proto = prompt_last[-1]
+                        if prompt_proto.shape[0] != B:
+                            # then transpose
+                            if prompt_proto.shape[1] == B:
+                                prompt_proto = prompt_proto.transpose(0, 1)
+                            else:
+                                prompt_proto = prompt_proto.reshape(B, -1)[:, :prompt_proto.numel() // B]
+                    else:
+                        # final fallback: create zeros
+                        prompt_proto = torch.zeros((B, prompt_last.numel() // B), device=device, dtype=prompt_last.dtype)
+                
                     # get visual pooled representation: prefer decoder_hs (out["decoder_hs"])
                     decoder_hs = out.get("decoder_hs", None)
                     if decoder_hs is not None:
                         if decoder_hs.dim() == 4:
-                            hs_last = decoder_hs[-1]  # (B, Q, D)
+                            hs_last = decoder_hs[-1]  # (L,B,Q,D) -> maybe last -> (B,Q,D) if dims were reduced
+                            # If hs_last dim is (L,B,Q,D) already handled, we ensure hs_last is (B,Q,D)
+                            if hs_last.dim() == 4:
+                                hs_last = hs_last[-1]
                         else:
-                            hs_last = decoder_hs  # (B, Q, D)
+                            hs_last = decoder_hs  # expecting (B,Q,D)
+                        # If hs_last is (Q,B,D) transpose
+                        if hs_last.dim() == 3 and hs_last.shape[0] == Q and hs_last.shape[1] == B:
+                            hs_last = hs_last.permute(1, 0, 2)
+                        # pool across queries
                         v_pooled = hs_last.mean(dim=1)  # (B, D)
-                        # compute contrastive only if batch sizes match
-                        if v_pooled.shape[0] == prompt_proto.shape[0]:
+                        # compute contrastive only if batch sizes / dims match
+                        if v_pooled.shape[0] == prompt_proto.shape[0] and v_pooled.shape[1] == prompt_proto.shape[1]:
                             align_loss = contrastive_loss_from_pooled(v_pooled, prompt_proto, temp=args.align_temp)
+                        else:
+                            # print debug to help if shapes mismatch
+                            print(f"[WARN] align shape mismatch: v_pooled {v_pooled.shape} prompt_proto {prompt_proto.shape}")
+                            align_loss = torch.tensor(0.0, device=device)
                     else:
-                        # fallback: if you can get encoder pooled hidden states, use them instead
-                        # e.g. if out contains 'encoder_hidden_states', you could do:
-                        # enc = out.get('encoder_hidden_states', None)
-                        # if enc is not None: v_pooled = enc.mean(0)  # etc.
                         align_loss = torch.tensor(0.0, device=device)
-
+                else:
+                    align_loss = torch.tensor(0.0, device=device)
                 # -------------------------
+
                 # Combine losses: use learned weights (Kendall) if requested, otherwise use args.loss_alpha/beta/gamma
                 if args.use_learned_loss_weights and len(learnable_log_vars) == 3:
                     # log_var_focal/log_var_dice/log_var_iou defined in main scope and added to optimizer
