@@ -326,6 +326,11 @@ def load_sam3_checkpoint(model: torch.nn.Module, ckpt_path: str):
 
 def main(args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+
+    # === 新增：从 args 里读出两个超参数 ===
+    MASK_DOWNSAMPLE = int(args.mask_downsample)
+    NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image)
+    
     if args.use_official:
         model = FineTuneSAM3Official(
             bpe_path=args.bpe_path,
@@ -630,42 +635,39 @@ def main(args: argparse.Namespace):
                 # ====== END DEBUG BLOCK ======
 
 
-
+                # matched branch — compute on downsampled masks to save memory
                 if tgt_idx is None or tgt_idx.numel() == 0:
                     loss_focal = torch.tensor(0.0, device=device)
                     loss_dice = torch.tensor(0.0, device=device)
                 else:
-                    tgt_masks = targets["segments"]
-                    pred_matched = pred_masks[batch_idx, src_idx]
-                    if pred_matched.shape[-2:] != tgt_masks.shape[-2:]:
-                        pred_matched = torch.nn.functional.interpolate(
-                            pred_matched.unsqueeze(1),
-                            size=tgt_masks.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
-                        ).squeeze(1)
-                    tgt_matched = tgt_masks[tgt_idx]
-                    num_boxes = targets["num_boxes"].sum().float().clamp(min=1.0)
-                    loss_focal = sam_sigmoid_focal_loss(
-                        pred_matched, tgt_matched, num_boxes, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False
-                    )
-                    loss_dice = sam_dice_loss(
-                        pred_matched, tgt_matched, num_boxes, loss_on_multimask=False, reduce=True
-                    )
-                    
-                    # -------------------------
-                    # 处理 unmatched(background) loss：随机采样并做归一化（按每图采样最多 K 个 negative queries）
-                    # parameters (add to parser if you like)
-                    NEG_SAMPLES_PER_IMAGE = int(args.neg_samples_per_image) if hasattr(args, "neg_samples_per_image") else 5
-                    MASK_DOWNSAMPLE = getattr(args, "mask_downsample", 256)  # 可在 parser 增加 --mask_downsample
+                    tgt_masks = targets["segments"]  # (G, H, W)
+                    pred_matched = pred_masks[batch_idx, src_idx]  # (M, H, W)
+                    tgt_matched = tgt_masks[tgt_idx]              # (M, H, W)
 
+                    # --- downsample matched to MASK_DOWNSAMPLE to save memory ----
+                    if pred_matched.dim() == 3:
+                        pm_ds = F.interpolate(pred_matched.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                              mode="bilinear", align_corners=False).squeeze(1)
+                    else:
+                        pm_ds = pred_matched
+                    if tgt_matched.dim() == 3:
+                        tm_ds = F.interpolate(tgt_matched.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                              mode="nearest").squeeze(1)
+                    else:
+                        tm_ds = tgt_matched
+
+                    num_boxes = float(max(1.0, src_idx.numel()))
+                    loss_focal = sam_sigmoid_focal_loss(pm_ds, tm_ds, num_boxes, alpha=0.25, gamma=2.0, loss_on_multimask=False, triton=False)
+                    loss_dice = sam_dice_loss(pm_ds, tm_ds, num_boxes, loss_on_multimask=False, reduce=True)
+
+                    # -------------------------
+                    # background/unmatched loss (sample K negatives per image), compute on downsampled masks
                     loss_focal_bg = torch.tensor(0.0, device=device)
                     loss_dice_bg = torch.tensor(0.0, device=device)
                     total_bg_samples = 0.0
                     all_q = torch.arange(pred_masks.shape[1], device=device)
-
                     for b in range(pred_masks.shape[0]):
-                        src_q, tgt_q = indices[b]  # indices 从 convert_matcher_output_to_indices 得到
+                        src_q, tgt_q = indices[b]
                         if src_q.numel() == 0:
                             unmatched_q = all_q
                         else:
@@ -680,34 +682,29 @@ def main(args: argparse.Namespace):
                         perm = torch.randperm(unmatched_q.numel(), device=device)[:k]
                         sampled_unmatched_q = unmatched_q[perm]
 
-                        preds_bg = pred_masks[b, sampled_unmatched_q]  # shape (k, H, W)
+                        preds_bg = pred_masks[b, sampled_unmatched_q]  # (k, H, W)
                         # Downsample to save memory
                         if preds_bg.dim() == 3:
-                            preds_bg_ds = F.interpolate(
-                                preds_bg.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
-                                mode="bilinear", align_corners=False
-                            ).squeeze(1)
+                            preds_bg_ds = F.interpolate(preds_bg.unsqueeze(1), size=(MASK_DOWNSAMPLE, MASK_DOWNSAMPLE),
+                                                        mode="bilinear", align_corners=False).squeeze(1)
                         else:
                             preds_bg_ds = preds_bg
 
                         zeros = torch.zeros_like(preds_bg_ds)
 
                         nb = float(sampled_unmatched_q.numel())
-                        # compute losses on downsampled masks (same API)
-                        loss_focal_bg += sam_sigmoid_focal_loss(
-                            preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
-                            loss_on_multimask=False, triton=False
-                        )
+                        loss_focal_bg += sam_sigmoid_focal_loss(preds_bg_ds, zeros, nb, alpha=0.25, gamma=2.0,
+                                                                loss_on_multimask=False, triton=False)
                         loss_dice_bg += sam_dice_loss(preds_bg_ds, zeros, nb, loss_on_multimask=False, reduce=True)
                         total_bg_samples += nb
 
-                    # normalize
                     if total_bg_samples > 0:
                         loss_focal_bg = loss_focal_bg / (total_bg_samples / float(pred_masks.shape[0]))
                         loss_dice_bg = loss_dice_bg / (total_bg_samples / float(pred_masks.shape[0]))
 
                     loss_focal = loss_focal + 0.5 * loss_focal_bg
                     loss_dice = loss_dice + 0.5 * loss_dice_bg
+
 
                         
                 # -------------------------
@@ -770,7 +767,7 @@ def main(args: argparse.Namespace):
                 #         loss_iou = torch.tensor(0.0, device=device)
                 # else:
                 #     loss_iou = torch.tensor(0.0, device=device)
-                
+
                 loss_iou = torch.tensor(0.0, device=device)
                 # -------------------------
                 # Presence BCE loss (requires presence_head=True in model_builder)
@@ -933,5 +930,6 @@ if __name__ == "__main__":
     parser.add_argument("--align_temp", type=float, default=0.07, help="temperature for contrastive alignment")
     parser.add_argument("--presence_weight",type=float,default=1.0,help="weight for presence BCE loss")
     parser.add_argument("--use_learned_loss_weights", action="store_true", help="Use learnable log-variance weights for multi-loss balancing (Kendall)")
+    parser.add_argument("--mask_downsample", type=int, default=256, help="Downsample masks for background loss calculation to reduce memory")
     args = parser.parse_args()
     main(args)
